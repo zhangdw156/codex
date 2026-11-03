@@ -51,9 +51,7 @@ fn restrict_specs_to(specs: Vec<ToolSpec>, names: &HashSet<String>) -> Vec<ToolS
         .filter_map(|spec| match spec {
             ToolSpec::Namespace(mut namespace) if namespace.name == "mcp__gaia2" => {
                 namespace.tools.retain(|tool| match tool {
-                    ResponsesApiNamespaceTool::Function(tool) => {
-                        allowed_names().contains(&tool.name)
-                    }
+                    ResponsesApiNamespaceTool::Function(tool) => names.contains(&tool.name),
                     ResponsesApiNamespaceTool::Custom(_) => false,
                 });
                 (!namespace.tools.is_empty()).then_some(ToolSpec::Namespace(namespace))
