@@ -1889,6 +1889,7 @@ async fn run_sampling_request(
             Arc::clone(&turn_diff_tracker),
             prompt,
             input_item_count,
+            first_attempt,
             cancellation_token.child_token(),
             &mut draining_for_mailbox,
         )
@@ -2762,10 +2763,19 @@ async fn try_run_sampling_request(
     turn_diff_tracker: SharedTurnDiffTracker,
     mut prompt: Prompt,
     input_item_count: usize,
+    first_attempt: bool,
     cancellation_token: CancellationToken,
     draining_for_mailbox: &mut bool,
 ) -> CodexResult<SamplingRequestResult> {
     if crate::glitter::before_request(&sess, &step_context, &mut prompt).await? {
+        if cancellation_token.is_cancelled() {
+            return Err(CodexErr::TurnAborted);
+        }
+        if !first_attempt {
+            return Err(CodexErr::Fatal(
+                "ARE ended before the failed model request could be retried".into(),
+            ));
+        }
         return Ok(SamplingRequestResult {
             needs_follow_up: false,
             last_agent_message: None,
