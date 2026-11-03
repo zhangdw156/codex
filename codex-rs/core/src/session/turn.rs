@@ -2719,6 +2719,9 @@ async fn drain_in_flight(
                 .await;
             }
             Err(err) => {
+                if crate::glitter::enabled() {
+                    return Err(err);
+                }
                 error_or_panic(format!("in-flight tool future failed during drain: {err}"));
             }
         }
@@ -3622,14 +3625,6 @@ async fn try_run_sampling_request(
         drain_in_flight(&mut in_flight, sess.clone(), &step_context).await?;
     }
 
-    // Successful ARE wait/reply results have been recorded before ending the native turn.
-    if crate::glitter::turn_ended(&sess).await? {
-        return Ok(SamplingRequestResult {
-            needs_follow_up: false,
-            last_agent_message: None,
-        });
-    }
-
     if should_emit_token_count {
         // A tool call such as request_user_input can intentionally pause the turn. Emit token
         // counts only after pending tools resolve so clients do not see progress events while the
@@ -3640,6 +3635,15 @@ async fn try_run_sampling_request(
 
     if cancellation_token.is_cancelled() {
         return Err(CodexErr::TurnAborted);
+    }
+
+    // A stopped ARE environment cannot turn a failed stream or cancellation into success.
+    // Successful wait/reply outputs have already been persisted by the ordered drain.
+    if response_completed && outcome.is_ok() && crate::glitter::turn_ended(&sess).await? {
+        return Ok(SamplingRequestResult {
+            needs_follow_up: false,
+            last_agent_message: None,
+        });
     }
 
     if should_emit_turn_diff {
