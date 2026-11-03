@@ -197,11 +197,12 @@ pub(crate) async fn run_turn(
             Ok(_) => Err(uploaded_audio_disabled_error()),
         };
     }
-    let auto_compaction_enabled = sess
-        .services
-        .thread_extension_data
-        .get::<AutoCompactionDisabled>()
-        .is_none();
+    let auto_compaction_enabled = !crate::glitter::enabled()
+        && sess
+            .services
+            .thread_extension_data
+            .get::<AutoCompactionDisabled>()
+            .is_none();
     let auto_summarization_enabled =
         auto_compaction_enabled && !turn_context.config.features.enabled(Feature::TokenBudget);
     if crate::guardian::is_basic_session_source(&turn_context.session_source) {
@@ -2756,11 +2757,17 @@ async fn try_run_sampling_request(
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
     turn_diff_tracker: SharedTurnDiffTracker,
-    prompt: Prompt,
+    mut prompt: Prompt,
     input_item_count: usize,
     cancellation_token: CancellationToken,
     draining_for_mailbox: &mut bool,
 ) -> CodexResult<SamplingRequestResult> {
+    if crate::glitter::before_request(&sess, &step_context, &mut prompt).await? {
+        return Ok(SamplingRequestResult {
+            needs_follow_up: false,
+            last_agent_message: None,
+        });
+    }
     let turn_context = Arc::clone(&step_context.turn);
     feedback_tags!(
         model = step_context.settings.model_info.slug.clone(),
@@ -2801,7 +2808,8 @@ async fn try_run_sampling_request(
         .await;
     let hooks = hooks_for_model_request(&sess, &step_context);
     let post_mode = hooks.execution_mode_for_event(HookEventName::PostModelRequest);
-    let defer_tool_dispatch = post_mode == Some(HookExecutionMode::Sync);
+    let defer_tool_dispatch =
+        crate::glitter::enabled() || post_mode == Some(HookExecutionMode::Sync);
     let finish_post_request = post_mode.map(|_| {
         let (post_request, completed) = tokio::sync::oneshot::channel();
         let (hook_done, wait_for_hook) = tokio::sync::oneshot::channel();
@@ -3582,6 +3590,14 @@ async fn try_run_sampling_request(
     )
     .await;
 
+    if crate::glitter::enabled() && !response_completed && !in_flight.is_empty() {
+        // A partial stream cannot commit side effects. Keep the acknowledged
+        // pre-request checkpoint authoritative instead of executing buffered calls.
+        return Err(CodexErr::Fatal(
+            "Incomplete Glitter response contains buffered tools; resume the saved checkpoint"
+                .into(),
+        ));
+    }
     if !in_flight.is_empty() {
         let _tool_blocking_timing_guard = turn_context
             .turn_timing_state
@@ -3593,6 +3609,14 @@ async fn try_run_sampling_request(
             turn.id = %turn_context.sub_id,
         );
         drain_in_flight(&mut in_flight, sess.clone(), &step_context).await?;
+    }
+
+    // Successful ARE wait/reply results have been recorded before ending the native turn.
+    if crate::glitter::turn_ended(&sess).await? {
+        return Ok(SamplingRequestResult {
+            needs_follow_up: false,
+            last_agent_message: None,
+        });
     }
 
     if should_emit_token_count {

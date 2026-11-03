@@ -146,7 +146,7 @@ impl ToolRouter {
     ) -> Self {
         let mut router = Self {
             registry,
-            model_visible_specs: model_visible_specs.into(),
+            model_visible_specs: crate::glitter::restrict_specs(model_visible_specs).into(),
             tool_mode,
             code_mode_tool_names,
             tool_namespaces_info,
@@ -258,6 +258,9 @@ impl ToolRouter {
     }
 
     pub fn tool_supports_parallel(&self, call: &ToolCall) -> bool {
+        if crate::glitter::enabled() {
+            return false;
+        }
         self.registry
             .supports_parallel_tool_calls(&call.tool_name)
             .unwrap_or(false)
@@ -404,6 +407,22 @@ impl ToolRouter {
             native_call,
             ..
         } = call;
+
+        if !crate::glitter::allowed(&tool_name) {
+            return Err(FunctionCallError::RespondToModel(
+                "Only current scenario tools may execute".into(),
+            ));
+        }
+        if crate::glitter::enabled() {
+            let status = crate::glitter::call(serde_json::json!({"operation": "status"}))
+                .await
+                .map_err(|error| FunctionCallError::Fatal(error.to_string()))?;
+            if status.get("stop").and_then(serde_json::Value::as_bool) == Some(true) {
+                return Err(FunctionCallError::RespondToModel(
+                    "The ARE turn has ended".into(),
+                ));
+            }
+        }
 
         // Keep the legacy ToolInvocation.turn field tied to the same request state until handlers migrate.
         let turn = Arc::clone(&step_context.turn);
