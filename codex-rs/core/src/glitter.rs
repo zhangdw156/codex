@@ -19,6 +19,14 @@ use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 
+/// Capabilities exposed by the app-server without loading a user home or model.
+pub fn capabilities() -> Value {
+    json!({"capabilities": [
+        "checkpoint_before_request", "scenario_tools_only", "ordered_tool_dispatch",
+        "terminal_tool_stop", "fatal_tool_errors", "failure_precedence", "resume_rollout"
+    ]})
+}
+
 pub(crate) fn enabled() -> bool {
     std::env::var_os("GLITTER_CODEX_SOCKET").is_some()
 }
