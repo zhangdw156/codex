@@ -2898,6 +2898,7 @@ async fn try_run_sampling_request(
         return Err(CodexErr::TurnAborted);
     }
     let mut in_flight: FuturesOrdered<InFlightFuture<'static>> = FuturesOrdered::new();
+    let mut glitter_tools = Vec::new();
     let mut needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;
     let mut active_item: Option<TurnItem> = None;
@@ -3164,7 +3165,11 @@ async fn try_run_sampling_request(
                         Err(err) => break Err(err),
                     };
                 if let Some(tool_future) = output_result.tool_future {
-                    in_flight.push_back(tool_future);
+                    if crate::glitter::enabled() {
+                        glitter_tools.push(tool_future);
+                    } else {
+                        in_flight.push_back(tool_future);
+                    }
                 }
                 if let Some(agent_message) = output_result.last_agent_message {
                     last_agent_message = Some(agent_message);
@@ -3590,7 +3595,7 @@ async fn try_run_sampling_request(
     )
     .await;
 
-    if crate::glitter::enabled() && !response_completed && !in_flight.is_empty() {
+    if crate::glitter::enabled() && !response_completed && !glitter_tools.is_empty() {
         // A partial stream cannot commit side effects. Keep the acknowledged
         // pre-request checkpoint authoritative instead of executing buffered calls.
         return Err(CodexErr::Fatal(
@@ -3598,7 +3603,7 @@ async fn try_run_sampling_request(
                 .into(),
         ));
     }
-    if !in_flight.is_empty() {
+    if !in_flight.is_empty() || !glitter_tools.is_empty() {
         let _tool_blocking_timing_guard = turn_context
             .turn_timing_state
             .begin_tool_blocking(tool_runtime.batch_timing());
@@ -3608,6 +3613,12 @@ async fn try_run_sampling_request(
             conversation.id = %sess.thread_id,
             turn.id = %turn_context.sub_id,
         );
+        // FuturesOrdered preserves result order, but polls all futures concurrently.
+        // Start and persist one deferred Glitter call at a time in response order.
+        for tool_future in glitter_tools {
+            in_flight.push_back(tool_future);
+            drain_in_flight(&mut in_flight, sess.clone(), &step_context).await?;
+        }
         drain_in_flight(&mut in_flight, sess.clone(), &step_context).await?;
     }
 
