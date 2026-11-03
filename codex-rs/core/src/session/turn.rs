@@ -197,11 +197,12 @@ pub(crate) async fn run_turn(
             Ok(_) => Err(uploaded_audio_disabled_error()),
         };
     }
-    let auto_compaction_enabled = sess
-        .services
-        .thread_extension_data
-        .get::<AutoCompactionDisabled>()
-        .is_none();
+    let auto_compaction_enabled = !crate::glitter::enabled()
+        && sess
+            .services
+            .thread_extension_data
+            .get::<AutoCompactionDisabled>()
+            .is_none();
     let auto_summarization_enabled =
         auto_compaction_enabled && !turn_context.config.features.enabled(Feature::TokenBudget);
     if crate::guardian::is_basic_session_source(&turn_context.session_source) {
@@ -1888,6 +1889,7 @@ async fn run_sampling_request(
             Arc::clone(&turn_diff_tracker),
             prompt,
             input_item_count,
+            first_attempt,
             cancellation_token.child_token(),
             &mut draining_for_mailbox,
         )
@@ -2718,6 +2720,9 @@ async fn drain_in_flight(
                 .await;
             }
             Err(err) => {
+                if crate::glitter::enabled() {
+                    return Err(err);
+                }
                 error_or_panic(format!("in-flight tool future failed during drain: {err}"));
             }
         }
@@ -2756,11 +2761,26 @@ async fn try_run_sampling_request(
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
     turn_diff_tracker: SharedTurnDiffTracker,
-    prompt: Prompt,
+    mut prompt: Prompt,
     input_item_count: usize,
+    first_attempt: bool,
     cancellation_token: CancellationToken,
     draining_for_mailbox: &mut bool,
 ) -> CodexResult<SamplingRequestResult> {
+    if crate::glitter::before_request(&sess, &step_context, &mut prompt).await? {
+        if cancellation_token.is_cancelled() {
+            return Err(CodexErr::TurnAborted);
+        }
+        if !first_attempt {
+            return Err(CodexErr::Fatal(
+                "ARE ended before the failed model request could be retried".into(),
+            ));
+        }
+        return Ok(SamplingRequestResult {
+            needs_follow_up: false,
+            last_agent_message: None,
+        });
+    }
     let turn_context = Arc::clone(&step_context.turn);
     feedback_tags!(
         model = step_context.settings.model_info.slug.clone(),
@@ -2801,7 +2821,8 @@ async fn try_run_sampling_request(
         .await;
     let hooks = hooks_for_model_request(&sess, &step_context);
     let post_mode = hooks.execution_mode_for_event(HookEventName::PostModelRequest);
-    let defer_tool_dispatch = post_mode == Some(HookExecutionMode::Sync);
+    let defer_tool_dispatch =
+        crate::glitter::enabled() || post_mode == Some(HookExecutionMode::Sync);
     let finish_post_request = post_mode.map(|_| {
         let (post_request, completed) = tokio::sync::oneshot::channel();
         let (hook_done, wait_for_hook) = tokio::sync::oneshot::channel();
@@ -2890,6 +2911,7 @@ async fn try_run_sampling_request(
         return Err(CodexErr::TurnAborted);
     }
     let mut in_flight: FuturesOrdered<InFlightFuture<'static>> = FuturesOrdered::new();
+    let mut glitter_tools = Vec::new();
     let mut needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;
     let mut active_item: Option<TurnItem> = None;
@@ -3156,7 +3178,11 @@ async fn try_run_sampling_request(
                         Err(err) => break Err(err),
                     };
                 if let Some(tool_future) = output_result.tool_future {
-                    in_flight.push_back(tool_future);
+                    if crate::glitter::enabled() {
+                        glitter_tools.push(tool_future);
+                    } else {
+                        in_flight.push_back(tool_future);
+                    }
                 }
                 if let Some(agent_message) = output_result.last_agent_message {
                     last_agent_message = Some(agent_message);
@@ -3582,7 +3608,15 @@ async fn try_run_sampling_request(
     )
     .await;
 
-    if !in_flight.is_empty() {
+    if crate::glitter::enabled() && !response_completed && !glitter_tools.is_empty() {
+        // A partial stream cannot commit side effects. Keep the acknowledged
+        // pre-request checkpoint authoritative instead of executing buffered calls.
+        return Err(CodexErr::Fatal(
+            "Incomplete Glitter response contains buffered tools; resume the saved checkpoint"
+                .into(),
+        ));
+    }
+    if !in_flight.is_empty() || !glitter_tools.is_empty() {
         let _tool_blocking_timing_guard = turn_context
             .turn_timing_state
             .begin_tool_blocking(tool_runtime.batch_timing());
@@ -3592,6 +3626,12 @@ async fn try_run_sampling_request(
             conversation.id = %sess.thread_id,
             turn.id = %turn_context.sub_id,
         );
+        // FuturesOrdered preserves result order, but polls all futures concurrently.
+        // Start and persist one deferred Glitter call at a time in response order.
+        for tool_future in glitter_tools {
+            in_flight.push_back(tool_future);
+            drain_in_flight(&mut in_flight, sess.clone(), &step_context).await?;
+        }
         drain_in_flight(&mut in_flight, sess.clone(), &step_context).await?;
     }
 
@@ -3605,6 +3645,15 @@ async fn try_run_sampling_request(
 
     if cancellation_token.is_cancelled() {
         return Err(CodexErr::TurnAborted);
+    }
+
+    // A stopped ARE environment cannot turn a failed stream or cancellation into success.
+    // Successful wait/reply outputs have already been persisted by the ordered drain.
+    if response_completed && outcome.is_ok() && crate::glitter::turn_ended(&sess).await? {
+        return Ok(SamplingRequestResult {
+            needs_follow_up: false,
+            last_agent_message: None,
+        });
     }
 
     if should_emit_turn_diff {
